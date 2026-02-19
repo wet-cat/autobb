@@ -945,6 +945,11 @@ Examples:
                         help="Also export grouped markdown reports under reports/<domain>/")
     parser.add_argument("--confidence-threshold", type=float, default=0.70,
                         help="Minimum confidence to include in primary markdown submission queue (default: 0.70)")
+    parser.add_argument("--niche", choices=["authenticated_webapps", "graphql_api_auth", "cloud_exposure_chain", "js_heavy_spa"],
+                        default="graphql_api_auth",
+                        help="Scanner/report niche profile to optimize high-value workflow (default: graphql_api_auth)")
+    parser.add_argument("--outcomes-file", metavar="JSON",
+                        help="Optional JSON array with prior submission outcomes to tune KPI accuracy")
     args = parser.parse_args()
 
     engine = ScanEngine(threads=args.threads, timeout=args.timeout, proxy=args.proxy)
@@ -976,7 +981,7 @@ Examples:
 
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = f"autobb_report_{ts}.json"
-        engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold)
+        engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold, niche=args.niche, outcomes_file=args.outcomes_file)
         print(f"\n[+] Report saved: {path}")
         if args.export_md:
             print(f"[+] Markdown reports: reports/<domain>/SUMMARY.md")
@@ -1001,7 +1006,7 @@ Examples:
         if stats["findings"] > 0:
             ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = f"autobb_report_{ts}.json"
-            engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold)
+            engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold, niche=args.niche, outcomes_file=args.outcomes_file)
             print(f"\n  Report:     {path}")
             if args.export_md:
                 print("  Markdown:   reports/<domain>/SUMMARY.md")
