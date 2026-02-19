@@ -29,6 +29,8 @@ import os
 import sys
 import subprocess
 
+from reporting import ReportGenerator
+
 try:
     import requests
     from requests.adapters import HTTPAdapter
@@ -2394,6 +2396,7 @@ class ScanEngine:
             """Run Nuclei in background so it doesn't block other checks"""
             try:
                 import subprocess
+
                 # Check if nuclei is available
                 result_check = subprocess.run(['nuclei', '-version'], capture_output=True, timeout=3)
                 if result_check.returncode != 0:
@@ -2567,17 +2570,32 @@ class ScanEngine:
                 out[f.severity.label.lower()] += 1
         return out
 
-    def export_json(self, path: str):
+    def export_json(self, path: str, export_md: bool = False, reports_root: str = "reports", confidence_threshold: float = 0.70):
         data = {}
+        markdown_exports = {}
+        reporter = ReportGenerator(confidence_threshold=confidence_threshold) if export_md else None
+
         for domain, t in self.targets.items():
+            findings = [f.to_dict() for f in t.findings]
             data[domain] = {
                 "status":     t.status,
                 "duration":   round(t.duration, 2),
                 "subdomains": list(t.subdomains.keys()),
-                "findings":   [f.to_dict() for f in t.findings],
+                "findings":   findings,
             }
+            if reporter:
+                markdown_exports[domain] = reporter.export_domain_reports(domain, t.findings, reports_root=reports_root)
+
+        payload = {"scan_date": datetime.now().isoformat(), "results": data}
+        if export_md:
+            payload["markdown_reports"] = {
+                "root": reports_root,
+                "confidence_threshold": confidence_threshold,
+                "domains": markdown_exports,
+            }
+
         with open(path, "w") as fh:
-            json.dump({"scan_date": datetime.now().isoformat(), "results": data}, fh, indent=2)
+            json.dump(payload, fh, indent=2)
         return path
 
     def stop(self):
