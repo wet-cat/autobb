@@ -2570,10 +2570,10 @@ class ScanEngine:
                 out[f.severity.label.lower()] += 1
         return out
 
-    def export_json(self, path: str, export_md: bool = False, reports_root: str = "reports", confidence_threshold: float = 0.70):
+    def export_json(self, path: str, export_md: bool = False, reports_root: str = "reports", confidence_threshold: float = 0.70, niche: str = "graphql_api_auth", outcomes_file: str | None = None):
         data = {}
         markdown_exports = {}
-        reporter = ReportGenerator(confidence_threshold=confidence_threshold) if export_md else None
+        reporter = ReportGenerator(confidence_threshold=confidence_threshold, niche=niche) if export_md else None
 
         for domain, t in self.targets.items():
             findings = [f.to_dict() for f in t.findings]
@@ -2584,13 +2584,14 @@ class ScanEngine:
                 "findings":   findings,
             }
             if reporter:
-                markdown_exports[domain] = reporter.export_domain_reports(domain, t.findings, reports_root=reports_root)
+                markdown_exports[domain] = reporter.export_domain_reports(domain, t.findings, reports_root=reports_root, outcomes_file=outcomes_file)
 
         payload = {"scan_date": datetime.now().isoformat(), "results": data}
         if export_md:
             payload["markdown_reports"] = {
                 "root": reports_root,
                 "confidence_threshold": confidence_threshold,
+                "niche": niche,
                 "domains": markdown_exports,
             }
 
