@@ -847,7 +847,7 @@ def tui_main(stdscr, engine: ScanEngine):
             elif key in ("x", "X"):
                 ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
                 path = f"autobb_report_{ts}.json"
-                engine.export_json(path)
+                engine.export_json(path, export_md=False)
                 state.status_msg = f"Exported → {path}"
 
         # ─ findings keys ────────────────────────────────────────────────────────
@@ -941,6 +941,10 @@ Examples:
                         help="HTTP proxy (e.g. http://127.0.0.1:8080)")
     parser.add_argument("--no-tui", action="store_true",
                         help="Run headlessly and output JSON only")
+    parser.add_argument("--export-md", action="store_true",
+                        help="Also export grouped markdown reports under reports/<domain>/")
+    parser.add_argument("--confidence-threshold", type=float, default=0.70,
+                        help="Minimum confidence to include in primary markdown submission queue (default: 0.70)")
     args = parser.parse_args()
 
     engine = ScanEngine(threads=args.threads, timeout=args.timeout, proxy=args.proxy)
@@ -972,8 +976,10 @@ Examples:
 
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = f"autobb_report_{ts}.json"
-        engine.export_json(path)
+        engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold)
         print(f"\n[+] Report saved: {path}")
+        if args.export_md:
+            print(f"[+] Markdown reports: reports/<domain>/SUMMARY.md")
         stats = engine.stats()
         print(f"[+] Findings: {stats['findings']}  Critical: {stats['critical']}  High: {stats['high']}")
     else:
@@ -995,8 +1001,10 @@ Examples:
         if stats["findings"] > 0:
             ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = f"autobb_report_{ts}.json"
-            engine.export_json(path)
+            engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold)
             print(f"\n  Report:     {path}")
+            if args.export_md:
+                print("  Markdown:   reports/<domain>/SUMMARY.md")
         print()
 
 if __name__ == "__main__":
