@@ -453,7 +453,7 @@ class Renderer:
                 
                 items.append({
                     'type': 'finding',
-                    'priority': f.severity.value,
+                    'priority': f.severity.rank,
                     'label': icon,
                     'title': f.vuln_type[:50],
                     'details': f"{f.subdomain[:30]}{f.endpoint[:20]}"[:48],
@@ -463,7 +463,15 @@ class Renderer:
                 })
         
         # Sort by priority (lower = more important)
-        items.sort(key=lambda x: x['priority'])
+        def sort_priority(item):
+            p = item.get('priority', 99)
+            if isinstance(p, tuple):
+                return p[0]
+            if isinstance(p, int):
+                return p
+            return 99
+
+        items.sort(key=sort_priority)
         
         if not items:
             safe_addstr(self.scr, row + 3, (w-50)//2, 

@@ -659,6 +659,31 @@ class SubdomainEnumerator:
         "readme":        ["Project doesnt exist yet"],
     }
 
+
+    TAKEOVER_SERVICE_HINTS = {
+        "github": ["github", "github.io"],
+        "heroku": ["heroku", "herokudns", "herokucdn"],
+        "aws_s3": ["amazonaws.com", "s3"],
+        "shopify": ["shopify"],
+        "fastly": ["fastly"],
+        "zendesk": ["zendesk"],
+        "azure": ["azure", "azureedge", "trafficmanager"],
+        "bitbucket": ["bitbucket"],
+        "ghost": ["ghost"],
+        "surge": ["surge.sh"],
+        "intercom": ["intercom"],
+        "teamwork": ["teamwork"],
+        "helpscout": ["helpscout"],
+        "wordpress": ["wordpress.com", "wpengine"],
+        "freshdesk": ["freshdesk"],
+        "uservoice": ["uservoice"],
+        "pantheon": ["pantheonsite"],
+        "unbounce": ["unbounce"],
+        "strikingly": ["strikingly"],
+        "uberflip": ["uberflip"],
+        "readme": ["readme.io"],
+    }
+
     def __init__(self, dns: DNSEngine, http: HTTPEngine, notify_cb: Callable = None):
         self.dns    = dns
         self.http   = http
@@ -784,25 +809,36 @@ class SubdomainEnumerator:
         for fqdn, info in found.items():
             takeover = self._check_takeover(fqdn)
             if takeover:
-                # Create a Finding object for subdomain takeover
                 from datetime import datetime
+
+                service = takeover["service"]
+                confidence = takeover["confidence"]
+                severity = Severity.CRITICAL if confidence >= 0.90 else Severity.HIGH
+                label = "Subdomain Takeover" if confidence >= 0.90 else "Potential Subdomain Takeover"
+
                 takeover_finding = Finding(
                     id=hashlib.md5(f"takeover-{fqdn}".encode()).hexdigest()[:12],
-                    vuln_type=f"Subdomain Takeover ({takeover})",
-                    severity=Severity.CRITICAL,
+                    vuln_type=f"{label} ({service})",
+                    severity=severity,
                     target=fqdn,
                     subdomain=fqdn,
                     endpoint="/",
                     param="",
-                    description=f"Subdomain {fqdn} vulnerable to takeover via {takeover} - CNAME exists but service unclaimed",
-                    evidence=f"Service: {takeover}, CNAME points to unclaimed resource",
+                    description=(
+                        f"Subdomain {fqdn} appears vulnerable to takeover via {service}. "
+                        f"Matched provider signature with status {takeover['status_code']}."
+                    ),
+                    evidence=(
+                        f"Service={service}; signature='{takeover['matched_signature']}'; "
+                        f"provider_hint={'yes' if takeover['provider_hint'] else 'no'}; status={takeover['status_code']}"
+                    ),
                     payload="",
-                    request=f"Check CNAME record for {fqdn}",
+                    request=f"Check DNS/CNAME and provider claim state for {fqdn}",
                     response="",
-                    cvss=9.0,
+                    cvss=9.0 if severity == Severity.CRITICAL else 8.0,
                     cwe="CWE-350",
-                    remediation=f"Remove DNS record or claim the {takeover} subdomain immediately to prevent takeover",
-                    confidence=0.95,
+                    remediation=f"Remove DNS record or claim the {service} subdomain immediately to prevent takeover",
+                    confidence=confidence,
                     references=[
                         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/10-Test_for_Subdomain_Takeover",
                         "https://github.com/EdOverflow/can-i-take-over-xyz"
@@ -811,9 +847,9 @@ class SubdomainEnumerator:
                     verified=False,
                     false_positive=False,
                 )
-                # Store it temporarily to add to target findings later
                 info.takeover_finding = takeover_finding
-                self.notify(f"[!] SUBDOMAIN TAKEOVER on {fqdn} ({takeover})", "CRITICAL")
+                level = "CRITICAL" if severity == Severity.CRITICAL else "HIGH"
+                self.notify(f"[!] {label.upper()} on {fqdn} ({service})", level)
 
         return found
 
@@ -869,15 +905,40 @@ class SubdomainEnumerator:
             pass
         return results
 
-    def _check_takeover(self, fqdn: str) -> Optional[str]:
+    def _check_takeover(self, fqdn: str) -> Optional[Dict[str, Any]]:
         for scheme in ("https://", "http://"):
             r = self.http.get(scheme + fqdn)
-            if r:
-                body = r.text or ""
-                for service, sigs in self.TAKEOVER_SIGS.items():
-                    for sig in sigs:
-                        if sig.lower() in body.lower():
-                            return service
+            if not r:
+                continue
+
+            body = (r.text or "").lower()
+            headers_blob = " ".join(f"{k}:{v}" for k, v in dict(getattr(r, "headers", {})).items()).lower()
+            final_url = str(getattr(r, "url", "") or "").lower()
+            status_code = int(getattr(r, "status_code", 0) or 0)
+            suspicious_status = status_code in {403, 404, 410, 421, 500, 503}
+
+            for service, sigs in self.TAKEOVER_SIGS.items():
+                for sig in sigs:
+                    if sig.lower() not in body:
+                        continue
+
+                    hint_tokens = self.TAKEOVER_SERVICE_HINTS.get(service, [])
+                    provider_hint = any(tok in body or tok in headers_blob or tok in final_url for tok in hint_tokens)
+
+                    # Prevent noisy generic matches (e.g., "page not found") from firing alone.
+                    if not provider_hint and not suspicious_status:
+                        continue
+                    if service == "strikingly" and not provider_hint:
+                        continue
+
+                    confidence = 0.95 if (provider_hint and suspicious_status) else 0.82
+                    return {
+                        "service": service,
+                        "matched_signature": sig,
+                        "provider_hint": provider_hint,
+                        "status_code": status_code,
+                        "confidence": confidence,
+                    }
         return None
 
 # ─── Web Crawler ────────────────────────────────────────────────────────────────
