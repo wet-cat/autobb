@@ -909,15 +909,24 @@ class Crawler:
         if not base:
             return
 
-        r = self.http.get(base)
-        if not r:
-            return
+        # Seed endpoint/parameter candidates early so scanners still run when
+        # crawling is blocked by WAF, bot protection, or dynamic frontends.
+        self._seed_default_attack_surface(info)
 
-        info.alive    = True
-        info.status   = r.status_code
-        info.headers  = dict(r.headers)
-        info.techs    = self.fp.fingerprint(dict(r.headers), r.text or "")
+        # A resolvable/responding base URL is enough to consider target alive for
+        # downstream checks, even if the initial GET is blocked/intermittent.
+        info.alive = True
         info.endpoints.add("/")
+
+        r = self.http.get(base)
+        if r:
+            info.status = r.status_code
+            info.status_code = r.status_code
+            info.headers = dict(r.headers)
+            info.techs = self.fp.fingerprint(dict(r.headers), r.text or "")
+        else:
+            info.status = 0
+            info.status_code = 0
 
         # Probe interesting paths
         def check_path(path):
@@ -932,11 +941,14 @@ class Crawler:
                 if result:
                     path, status, preview = result
                     info.endpoints.add(path)
+                    if status == 200 and any(x in path.lower() for x in ("api", "graphql", "admin", "debug", "config")):
+                        info.interesting = True
+                        info.interest_score += 2
                     if status == 200:
                         self.notify(f"[path] {info.fqdn}{path} [{status}]", "INFO")
 
         # Crawl HTML for links & forms
-        if HAS_BS4 and r.text:
+        if HAS_BS4 and r and r.text:
             self._extract_html(info, base, r.text)
 
     def _extract_html(self, info: SubdomainInfo, base: str, html: str):
@@ -946,22 +958,28 @@ class Crawler:
 
             # Links
             for tag in soup.find_all("a", href=True):
-                href = tag["href"]
-                if href.startswith("/") and not href.startswith("//"):
-                    info.endpoints.add(href.split("?")[0])
-                elif parsed_base.netloc in href:
-                    p = urllib.parse.urlparse(href).path
-                    info.endpoints.add(p.split("?")[0] or "/")
+                href = (tag["href"] or "").strip()
+                if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                    continue
 
-                # Extract query params
-                if "?" in href:
-                    qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
-                    for k in qs:
-                        info.params[href.split("?")[0]].add(k)
+                full_href = urllib.parse.urljoin(base + "/", href)
+                parsed_href = urllib.parse.urlparse(full_href)
+                if parsed_href.netloc != parsed_base.netloc:
+                    continue
+
+                path = parsed_href.path or "/"
+                info.endpoints.add(path)
+
+                qs = urllib.parse.parse_qs(parsed_href.query)
+                for k in qs:
+                    info.params[path].add(k)
 
             # Forms
             for form in soup.find_all("form"):
-                action  = form.get("action", "/")
+                raw_action = (form.get("action") or "/").strip() or "/"
+                action_url = urllib.parse.urljoin(base + "/", raw_action)
+                parsed_action = urllib.parse.urlparse(action_url)
+                action_path = parsed_action.path or "/"
                 method  = form.get("method", "GET").upper()
                 inputs  = []
                 for inp in form.find_all(["input", "textarea", "select"]):
@@ -972,16 +990,19 @@ class Crawler:
                             "type":  inp.get("type", "text"),
                             "value": inp.get("value", ""),
                         })
-                info.forms.append({"action": action, "method": method, "inputs": inputs})
-                if inputs and action:
+                info.forms.append({"action": action_path, "method": method, "inputs": inputs})
+                info.endpoints.add(action_path)
+                if inputs:
                     for inp in inputs:
-                        info.params[action].add(inp["name"])
+                        info.params[action_path].add(inp["name"])
 
             # Script src (JS endpoint extraction)
             for script in soup.find_all("script", src=True):
-                src = script["src"]
-                if src.endswith(".js"):
-                    full = src if src.startswith("http") else base + src
+                src = (script["src"] or "").strip()
+                if not src:
+                    continue
+                full = urllib.parse.urljoin(base + "/", src)
+                if full.endswith(".js"):
                     self._extract_js_endpoints(info, full)
         except Exception:
             pass
@@ -1005,11 +1026,34 @@ class Crawler:
                     info.endpoints.add(ep.split("?")[0])
 
     def _base_url(self, info: SubdomainInfo) -> Optional[str]:
+        # Some targets block/normalize HEAD requests; use GET as fallback to avoid
+        # incorrectly treating live assets as dead and skipping all scanners.
         for scheme in ("https://", "http://"):
-            r = self.http.head(scheme + info.fqdn)
+            url = scheme + info.fqdn
+            r = self.http.head(url)
             if r and r.status_code < 500:
-                return scheme + info.fqdn
+                return url
+
+            rg = self.http.get(url)
+            if rg and rg.status_code < 500:
+                return url
         return None
+
+    @staticmethod
+    def _seed_default_attack_surface(info: SubdomainInfo):
+        common_endpoints = {
+            "/", "/api", "/api/v1", "/api/v2", "/graphql", "/login",
+            "/search", "/admin", "/debug", "/oauth/token",
+        }
+        common_params = {
+            "id", "user_id", "account_id", "q", "search", "query", "url",
+            "redirect", "next", "return", "file", "path", "sort",
+            "page", "limit", "offset", "token", "email",
+        }
+
+        for endpoint in common_endpoints:
+            info.endpoints.add(endpoint)
+            info.params[endpoint].update(common_params)
 
 # ─── Vulnerability Checkers ─────────────────────────────────────────────────────
 
@@ -2154,6 +2198,77 @@ class MassAssignmentChecker(VulnChecker):
         return findings
 
 
+class JSSecretsChecker(VulnChecker):
+    """Detect hardcoded secrets/tokens in JavaScript assets."""
+
+    SECRET_PATTERNS = [
+        ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}"), Severity.HIGH, "CWE-798"),
+        ("Google API Key", re.compile(r"AIza[0-9A-Za-z\-_]{35}"), Severity.MEDIUM, "CWE-798"),
+        ("GitHub Token", re.compile(r"ghp_[0-9A-Za-z]{36}"), Severity.HIGH, "CWE-798"),
+        ("Slack Token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}"), Severity.HIGH, "CWE-798"),
+        ("Private Key Block", re.compile(r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PRIVATE) PRIVATE KEY-----"), Severity.CRITICAL, "CWE-798"),
+        ("JWT Token", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"), Severity.MEDIUM, "CWE-200"),
+    ]
+
+    COMMON_JS_PATHS = [
+        "/app.js", "/main.js", "/bundle.js", "/static/js/main.js", "/assets/app.js",
+        "/config.js", "/env.js", "/runtime.js",
+    ]
+
+    def check(self, base: str, info: SubdomainInfo) -> List[Finding]:
+        findings = []
+        seen_matches = set()
+        candidates = set(self.COMMON_JS_PATHS)
+        for ep in info.endpoints:
+            if ep.lower().endswith(".js"):
+                candidates.add(ep)
+
+        for path in list(candidates)[:40]:
+            url = base + path
+            r = self.http.get(url)
+            if not r or r.status_code >= 400:
+                continue
+            body = r.text or ""
+            if not body:
+                continue
+            if len(body) > 2_000_000:
+                # Avoid spending excessive time on huge minified bundles.
+                continue
+
+            for label, pattern, sev, cwe in self.SECRET_PATTERNS:
+                m = pattern.search(body)
+                if not m:
+                    continue
+                secret_preview = m.group(0)
+                if len(secret_preview) > 80:
+                    secret_preview = secret_preview[:80] + "..."
+                match_key = (path, label, secret_preview)
+                if match_key in seen_matches:
+                    continue
+                seen_matches.add(match_key)
+
+                f = self._finding(
+                    vuln_type=f"JavaScript Secret Exposure ({label})",
+                    severity=sev,
+                    target=base,
+                    subdomain=info.fqdn,
+                    endpoint=path,
+                    param="",
+                    description=f"JavaScript asset appears to expose a hardcoded secret pattern: {label}",
+                    evidence=f"Matched `{label}` in {path}: {secret_preview}",
+                    payload="",
+                    cvss=8.2 if sev in (Severity.HIGH, Severity.CRITICAL) else 5.5,
+                    cwe=cwe,
+                    remediation="Remove hardcoded secrets from client-side assets and rotate leaked credentials immediately.",
+                    confidence=0.92,
+                )
+                findings.append(f)
+                self.notify(f"[{sev.label}] JS secret pattern {label} at {base}{path}", sev.label)
+                break
+
+        return findings
+
+
 # ─── Event Bus ──────────────────────────────────────────────────────────────────
 
 class EventBus:
@@ -2176,7 +2291,7 @@ class EventBus:
 # ─── Main Engine ────────────────────────────────────────────────────────────────
 
 class ScanEngine:
-    def __init__(self, threads: int = 25, timeout: int = 10, proxy: str = None, state_db_path: str = "autobb_state.db", scan_mode: str = "balanced"):
+    def __init__(self, threads: int = 25, timeout: int = 10, proxy: str = None, state_db_path: str = "autobb_state.db", scan_mode: str = "balanced", discord_webhook: str = None):
         self.threads  = threads
         self.bus      = EventBus()
         self.http     = HTTPEngine(timeout=timeout, proxy=proxy)
@@ -2190,6 +2305,9 @@ class ScanEngine:
         self.scan_mode = (scan_mode or "balanced").lower()
         if self.scan_mode not in {"balanced", "crazy", "profit"}:
             self.scan_mode = "balanced"
+        self.discord_webhook = (discord_webhook or "").strip() or None
+        self._discord_sent: Set[str] = set()
+        self._discord_lock = threading.Lock()
         
         # PERSISTENT STATE - Track changes across scans
         try:
@@ -2274,6 +2392,56 @@ class ScanEngine:
         conn.commit()
         return conn
 
+    def _emit_finding(self, finding: Finding):
+        self.bus.emit("finding", finding)
+        self._notify_discord_finding(finding)
+
+    def _notify_discord_finding(self, finding: Finding):
+        if not self.discord_webhook or not HAS_REQUESTS:
+            return
+
+        finding_id = getattr(finding, "id", None)
+        if not finding_id:
+            return
+
+        with self._discord_lock:
+            if finding_id in self._discord_sent:
+                return
+            self._discord_sent.add(finding_id)
+
+        try:
+            severity = getattr(finding, "severity", Severity.INFO)
+            sev_label = severity.label if isinstance(severity, Severity) else str(severity)
+            color_map = {
+                Severity.CRITICAL: 0xE74C3C,
+                Severity.HIGH: 0xE67E22,
+                Severity.MEDIUM: 0xF1C40F,
+                Severity.LOW: 0x2ECC71,
+                Severity.INFO: 0x3498DB,
+            }
+            description = str(getattr(finding, "description", "") or "")[:300] or "N/A"
+            evidence = str(getattr(finding, "evidence", "") or "")[:900] or "N/A"
+            payload = {
+                "username": "AutoBB",
+                "content": f"🔔 New finding: **{sev_label}** {getattr(finding, 'vuln_type', 'Finding')}",
+                "embeds": [{
+                    "title": str(getattr(finding, "vuln_type", "Finding")),
+                    "description": description,
+                    "color": color_map.get(severity, 0x3498DB),
+                    "fields": [
+                        {"name": "Target", "value": str(getattr(finding, "target", "") or "N/A"), "inline": True},
+                        {"name": "Host", "value": str(getattr(finding, "subdomain", "") or "N/A"), "inline": True},
+                        {"name": "Endpoint", "value": str(getattr(finding, "endpoint", "") or "/"), "inline": False},
+                        {"name": "Evidence", "value": evidence, "inline": False},
+                    ],
+                    "footer": {"text": f"Severity: {sev_label} | Confidence: {float(getattr(finding, 'confidence', 0.0)):.2f}"}
+                }]
+            }
+            requests.post(self.discord_webhook, json=payload, timeout=4)
+        except Exception:
+            # Never let notifications interrupt scanning.
+            return
+
     def add_target(self, domain: str):
         domain = domain.lower().strip()
         domain = domain.removeprefix("https://").removeprefix("http://")
@@ -2308,7 +2476,7 @@ class ScanEngine:
                 # Mark as complete
                 target = self.targets[domain]
                 target.status = "done"
-                target.duration = time.time() - target.scan_start
+                target.scan_end = time.time()
                 
                 stats = {
                     'subdomains': len(target.subdomains),
@@ -2403,7 +2571,7 @@ class ScanEngine:
         for fqdn, info in subdomains.items():
             if hasattr(info, 'takeover_finding') and info.takeover_finding:
                 target.findings.append(info.takeover_finding)
-                self.bus.emit("finding", info.takeover_finding)
+                self._emit_finding(info.takeover_finding)
 
         # 2. Probe + crawl + SSL
         self.bus.emit("phase", {"domain": domain, "phase": "Probing & Crawling"})
@@ -2500,6 +2668,7 @@ class ScanEngine:
             "apisec":   APISecurityChecker(self.http, notify),
             "hostheader": HostHeaderChecker(self.http, notify),
             "massassign": MassAssignmentChecker(self.http, notify),
+            "jssecrets": JSSecretsChecker(self.http, notify),
         }
         
         # Run Nuclei scan in BACKGROUND THREAD (non-blocking, fast)
@@ -2596,7 +2765,7 @@ class ScanEngine:
                             target.findings.append(finding)
                             nuclei_count += 1
                             notify(f"[{nuclei_sev.upper()}] Nuclei: {info_data.get('name', 'Unknown')}", nuclei_sev.upper())
-                            self.bus.emit("finding", finding)
+                            self._emit_finding(finding)
                         
                         except json.JSONDecodeError:
                             continue
@@ -2626,7 +2795,9 @@ class ScanEngine:
 
         def scan_sub(fqdn):
             info  = subdomains.get(fqdn)
-            if not info or not info.alive:
+            if not info:
+                return []
+            if not info.alive and not info.endpoints:
                 return []
             base  = ("https://" if 443 in (info.ports or []) else "http://") + fqdn
             found = []
@@ -2634,41 +2805,141 @@ class ScanEngine:
             for endpoint in list(info.endpoints)[:limits["endpoint_cap"]]:
                 params = info.params.get(endpoint, set()) or {"id", "q", "search", "url"}
                 for name, checker in checkers.items():
-                    if name in ("headers", "cors", "ssl", "files", "csrf", "xxe"):
+                    if name in ("headers", "cors", "ssl", "files", "csrf", "xxe", "jssecrets"):
                         continue
                     try:
                         found += checker.check(base, endpoint, params)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        notify(f"[!] {name} checker failed on {fqdn}{endpoint}: {exc}", "WARN")
             # Per-host checks
-            try: found += checkers["headers"].check(base, info)
-            except Exception: pass
-            try: found += checkers["cors"].check(base, info)
-            except Exception: pass
-            try: found += checkers["files"].check(base, info)
-            except Exception: pass
-            try: found += checkers["csrf"].check(base, info)
-            except Exception: pass
-            try: found += checkers["xxe"].check(base, info)
-            except Exception: pass
+            try:
+                found += checkers["headers"].check(base, info)
+            except Exception as exc:
+                notify(f"[!] headers checker failed on {fqdn}: {exc}", "WARN")
+            try:
+                found += checkers["cors"].check(base, info)
+            except Exception as exc:
+                notify(f"[!] cors checker failed on {fqdn}: {exc}", "WARN")
+            try:
+                found += checkers["files"].check(base, info)
+            except Exception as exc:
+                notify(f"[!] files checker failed on {fqdn}: {exc}", "WARN")
+            try:
+                found += checkers["csrf"].check(base, info)
+            except Exception as exc:
+                notify(f"[!] csrf checker failed on {fqdn}: {exc}", "WARN")
+            try:
+                found += checkers["xxe"].check(base, info)
+            except Exception as exc:
+                notify(f"[!] xxe checker failed on {fqdn}: {exc}", "WARN")
+            try:
+                found += checkers["jssecrets"].check(base, info)
+            except Exception as exc:
+                notify(f"[!] jssecrets checker failed on {fqdn}: {exc}", "WARN")
             if fqdn in ssl_info:
-                try: found += checkers["ssl"].check(info, ssl_info[fqdn])
-                except Exception: pass
+                try:
+                    found += checkers["ssl"].check(info, ssl_info[fqdn])
+                except Exception as exc:
+                    notify(f"[!] ssl checker failed on {fqdn}: {exc}", "WARN")
             return found
 
         live_subs = [f for f, i in subdomains.items() if i.alive]
+        if not live_subs:
+            # Fallback mode: still attempt scans on a bounded set of discovered
+            # subdomains that have seeded/discovered endpoints.
+            fallback = [fqdn for fqdn, info in subdomains.items() if info.endpoints]
+            live_subs = fallback[:10]
+            if live_subs:
+                notify(f"[!] No subdomains marked alive; entering fallback scan mode for {len(live_subs)} hosts", "WARN")
+
         sub_cap = limits.get("live_subdomain_cap")
         if sub_cap:
             live_subs = live_subs[:sub_cap]
+
+        endpoint_total = sum(len(subdomains[f].endpoints) for f in live_subs if f in subdomains)
+        notify(f"[*] Scan candidates: {len(live_subs)} hosts, {endpoint_total} endpoints", "INFO")
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as ex:
             for batch in ex.map(scan_sub, live_subs):
                 target.findings.extend(batch)
                 for f in batch:
-                    self.bus.emit("finding", f)
+                    self._emit_finding(f)
+
+        # Ensure every scan produces at least actionable reconnaissance output,
+        # even when no vulnerability signatures are matched.
+        self._add_recon_observation_findings(target, domain, subdomains, live_subs, endpoint_total)
 
         target.scan_end = time.time()
         target.status   = "done"
         self.bus.emit("scan_done", {"domain": domain, "findings": len(target.findings)})
+
+    def _add_recon_observation_findings(self, target: ScanTarget, domain: str, subdomains: Dict[str, SubdomainInfo], live_subs: List[str], endpoint_total: int):
+        """Add truthful info-level findings so scans always return useful output."""
+        if target.findings:
+            return
+
+        discovered_hosts = len(subdomains)
+        reachable_hosts = len(live_subs)
+        top_hosts = sorted(live_subs)[:5] if live_subs else sorted(subdomains.keys())[:5]
+        top_host_list = ", ".join(top_hosts) if top_hosts else "none"
+
+        overview = Finding(
+            id=_make_id(),
+            vuln_type="Recon: Attack Surface Overview",
+            severity=Severity.INFO,
+            target=domain,
+            subdomain=domain,
+            endpoint="/",
+            param="",
+            description="No confirmed exploit signature matched; reporting discovered attack surface for manual triage.",
+            evidence=(
+                f"discovered_hosts={discovered_hosts}; reachable_scan_hosts={reachable_hosts}; "
+                f"endpoint_candidates={endpoint_total}; sample_hosts={top_host_list}"
+            ),
+            payload="",
+            request="",
+            response="",
+            cvss=0.0,
+            cwe="CWE-200",
+            remediation="Review discovered hosts/endpoints and run targeted authenticated testing for business logic flaws.",
+            confidence=1.0,
+            references=["https://owasp.org/www-project-web-security-testing-guide/"],
+            verified=True,
+            false_positive=False,
+        )
+        target.findings.append(overview)
+        self._emit_finding(overview)
+
+        # Add one host-level recon observation when available to keep output concrete.
+        candidate = next((subdomains[h] for h in top_hosts if h in subdomains), None)
+        if candidate:
+            host_obs = Finding(
+                id=_make_id(),
+                vuln_type="Recon: Reachable Host Profile",
+                severity=Severity.INFO,
+                target=domain,
+                subdomain=candidate.fqdn,
+                endpoint="/",
+                param="",
+                description="Reachable host discovered with candidate endpoints and technology signals.",
+                evidence=(
+                    f"status={candidate.status_code or candidate.status}; ips={','.join(candidate.ips[:3]) or 'unknown'}; "
+                    f"ports={','.join(map(str, sorted(candidate.ports[:6]))) or 'unknown'}; "
+                    f"endpoints={len(candidate.endpoints)}; tech={','.join(candidate.techs[:5]) or 'unknown'}"
+                ),
+                payload="",
+                request="",
+                response="",
+                cvss=0.0,
+                cwe="CWE-200",
+                remediation="Prioritize authenticated/business-logic checks on this host and high-value endpoints.",
+                confidence=0.95,
+                references=["https://owasp.org/www-project-web-security-testing-guide/"],
+                verified=True,
+                false_positive=False,
+            )
+            target.findings.append(host_obs)
+            self._emit_finding(host_obs)
 
     def stats(self) -> Dict:
         out = {"targets": 0, "subdomains": 0, "findings": 0,

@@ -952,9 +952,18 @@ Examples:
                         help="Optional JSON array with prior submission outcomes to tune KPI accuracy")
     parser.add_argument("--scan-mode", choices=["balanced", "crazy", "profit"], default="balanced",
                         help="Scan intensity profile: balanced (default), crazy (max coverage), profit (high-signal)")
+    parser.add_argument("--discord-webhook", metavar="URL",
+                        help="Discord webhook URL for real-time finding alerts (or set DISCORD_WEBHOOK_URL)")
     args = parser.parse_args()
 
-    engine = ScanEngine(threads=args.threads, timeout=args.timeout, proxy=args.proxy, scan_mode=args.scan_mode)
+    discord_webhook = args.discord_webhook or os.getenv("DISCORD_WEBHOOK_URL")
+    engine = ScanEngine(
+        threads=args.threads,
+        timeout=args.timeout,
+        proxy=args.proxy,
+        scan_mode=args.scan_mode,
+        discord_webhook=discord_webhook,
+    )
 
     if args.targets:
         for t in args.targets:
