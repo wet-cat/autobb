@@ -39,6 +39,7 @@ python autobb_tui.py --no-tui -t example.com
 | `--confidence-threshold FLOAT` | Min confidence for primary submission queue (default: `0.70`) |
 | `--niche ...` | Niche profile used for prioritization and reporting |
 | `--outcomes-file JSON` | Optional historical outcomes file to tune KPI reporting |
+| `--scan-mode {balanced,crazy,profit}` | Scan intensity profile (`balanced` default). Use `crazy` for max coverage, `profit` for high-signal triage |
 
 ### Supported `--niche` values
 
@@ -55,6 +56,7 @@ Use these options together for best “accepted report rate” workflow:
 python autobb_tui.py \
   --no-tui \
   -t target.com api.target.com \
+  --scan-mode profit \
   --export-md \
   --confidence-threshold 0.75 \
   --niche graphql_api_auth \
@@ -104,6 +106,7 @@ Recognized KPI fields:
 ## 6) Practical profit tuning tips
 
 - Pick **one niche** per campaign (`--niche`) to avoid diluted signal.
+- Use `--scan-mode profit` when optimizing for acceptance rate; use `--scan-mode crazy` only for wide recon sweeps.
 - Raise `--confidence-threshold` if duplicates are too high.
 - Keep `--outcomes-file` updated weekly for better KPI-driven tuning.
 - Prioritize findings with higher submission score in `SUMMARY.md`.
@@ -111,7 +114,7 @@ Recognized KPI fields:
 
 ## 7) Troubleshooting
 
-- If startup fails with `NameError: name 'requests' is not defined`, install Python dependencies (including `requests`) before running.
+- If startup fails due to missing dependencies, install Python requirements (notably `requests`) before running.
 - If markdown export is empty, verify:
   - targets are alive/in-scope,
   - confidence threshold is not too high,

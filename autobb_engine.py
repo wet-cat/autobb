@@ -39,6 +39,9 @@ try:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     HAS_REQUESTS = True
 except ImportError:
+    requests = None
+    HTTPAdapter = None
+    Retry = None
     HAS_REQUESTS = False
 
 try:
@@ -340,7 +343,7 @@ class HTTPEngine:
             h.update(extra)
         return h
 
-    def get(self, url, params=None, headers=None, allow_redirects=True) -> Optional[requests.Response]:
+    def get(self, url, params=None, headers=None, allow_redirects=True) -> Optional[Any]:
         if not HAS_REQUESTS:
             return None
         try:
@@ -354,7 +357,7 @@ class HTTPEngine:
         except Exception:
             return None
 
-    def post(self, url, data=None, json_data=None, headers=None) -> Optional[requests.Response]:
+    def post(self, url, data=None, json_data=None, headers=None) -> Optional[Any]:
         if not HAS_REQUESTS:
             return None
         try:
@@ -367,7 +370,7 @@ class HTTPEngine:
         except Exception:
             return None
 
-    def head(self, url) -> Optional[requests.Response]:
+    def head(self, url) -> Optional[Any]:
         if not HAS_REQUESTS:
             return None
         try:
@@ -548,7 +551,7 @@ class TechFingerprinter:
 # ─── Subdomain Enumerator ───────────────────────────────────────────────────────
 
 class SubdomainEnumerator:
-    # TOP 500 most common subdomains (expanded from 120)
+    # TOP 700+ most common and high-value subdomains
     WORDLIST = [
         # Core infrastructure
         "www","mail","ftp","localhost","webmail","smtp","pop","ns1","ns2","ns3","ns4","ns5",
@@ -610,6 +613,23 @@ class SubdomainEnumerator:
         "phpmyadmin","adminer","secret","secrets","config","configuration","env",
         "jenkins2","sonar","sonarqube","jira","confluence","bamboo","crowd","s3",
         "bucket","lambda","ec2","rds","cloudfront","terraform","ansible","puppet","chef",
+        # Enterprise and security tooling
+        "okta","auth0","sentry","newrelic","datadog","pagerduty","crowdstrike","sentinel",
+        "siem","soc","security","waf","firewall","ids","ips","edr","xdr",
+        # Extra infra/app permutations
+        "gateway","edge","origin","proxy","reverse-proxy","admin-api","internal-api",
+        "private-api","public-api","service","services","microservice","grpc","rpc",
+        "billing-api","payments","pay","customer-api","partner-api","integration",
+        # Additional environment patterns
+        "dev1","dev2","dev3","qa1","qa2","stg","stg1","stg2","prod1","prod2",
+        "canary","blue","green","dr","failover","hotfix","feature","experimental",
+        # Country / region style prefixes
+        "us-east","us-west","eu-west","eu-central","ap-south","ap-east","na","emea","latam",
+    ]
+
+    PERMUTATION_SUFFIXES = [
+        "dev", "test", "stage", "staging", "qa", "uat", "prod", "production", "internal", "admin",
+        "api", "old", "legacy", "backup", "beta",
     ]
 
     TAKEOVER_SIGS = {
@@ -676,30 +696,18 @@ class SubdomainEnumerator:
                     found[fqdn] = SubdomainInfo(fqdn=fqdn, ips=ips)
                     self.notify(f"[subdomain] {fqdn} → {', '.join(ips)}", "FOUND")
         
-        # Subfinder integration (passive, 50+ sources)
-        try:
-            subprocess.run(['subfinder', '-version'], capture_output=True, timeout=2, check=True)
-            self.notify(f"[*] Running Subfinder (passive enumeration)...", "INFO")
-            try:
-                cmd = ['subfinder', '-d', domain, '-all', '-silent', '-timeout', '2', '-t', '50']
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-                
-                subfinder_count = 0
-                for line in result.stdout.strip().split('\n'):
-                    subdomain = line.strip().lower()
-                    if subdomain and subdomain not in found and '.' in subdomain:
-                        ips = self.dns.resolve(subdomain)
-                        if ips:
-                            found[subdomain] = SubdomainInfo(fqdn=subdomain, ips=ips)
-                            subfinder_count += 1
-                
-                if subfinder_count > 0:
-                    self.notify(f"[+] Subfinder found {subfinder_count} additional subdomains", "INFO")
-            
-            except subprocess.TimeoutExpired:
-                self.notify(f"[!] Subfinder timeout after 90s", "WARN")
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass  # Subfinder not installed
+        # Passive tool integrations
+        passive_tools = [
+            ("subfinder", ["subfinder", "-d", domain, "-all", "-silent", "-timeout", "2", "-t", "50"], 120),
+            ("assetfinder", ["assetfinder", "--subs-only", domain], 90),
+            ("findomain", ["findomain", "-t", domain, "-q"], 120),
+            ("amass", ["amass", "enum", "-passive", "-d", domain, "-silent"], 180),
+        ]
+
+        for tool_name, cmd, timeout in passive_tools:
+            tool_count = self._run_passive_tool(tool_name, cmd, timeout, found)
+            if tool_count > 0:
+                self.notify(f"[+] {tool_name} found {tool_count} additional subdomains", "INFO")
 
         # Certificate transparency (attempt crt.sh)
         ct_subs = self._ct_lookup(domain)
@@ -709,6 +717,29 @@ class SubdomainEnumerator:
                 if ips:
                     found[sub] = SubdomainInfo(fqdn=sub, ips=ips)
                     self.notify(f"[CT] {sub} → {', '.join(ips)}", "FOUND")
+
+        # Permutation expansion from discovered labels (e.g., admin -> admin-dev)
+        permutation_candidates = set()
+        for sub in list(found.keys()):
+            label = sub[:-(len(domain) + 1)] if sub.endswith(f".{domain}") else ""
+            if not label or "." in label:
+                continue
+            for suffix in self.PERMUTATION_SUFFIXES:
+                if label.endswith(f"-{suffix}") or label.startswith(f"{suffix}-"):
+                    continue
+                permutation_candidates.add(f"{label}-{suffix}.{domain}")
+                permutation_candidates.add(f"{suffix}-{label}.{domain}")
+
+        if permutation_candidates:
+            self.notify(f"[*] Trying {len(permutation_candidates)} generated subdomain permutations...", "INFO")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=40) as ex:
+                futures = {ex.submit(self.dns.resolve, sub): sub for sub in permutation_candidates}
+                for fut in concurrent.futures.as_completed(futures):
+                    sub = futures[fut]
+                    ips = fut.result()
+                    if ips and sub not in found:
+                        found[sub] = SubdomainInfo(fqdn=sub, ips=ips)
+                        self.notify(f"[PERM] {sub} → {', '.join(ips)}", "FOUND")
         
         # ═══ CLASSIFY INTERESTING SUBDOMAINS ═══
         interesting_patterns = {
@@ -785,6 +816,38 @@ class SubdomainEnumerator:
                 self.notify(f"[!] SUBDOMAIN TAKEOVER on {fqdn} ({takeover})", "CRITICAL")
 
         return found
+
+    def _run_passive_tool(self, tool_name: str, cmd: List[str], timeout: int, found: Dict[str, SubdomainInfo]) -> int:
+        """Run passive enum tool and merge discovered subdomains."""
+        probe_args = {
+            "subfinder": ["subfinder", "-version"],
+            "assetfinder": ["assetfinder", "--help"],
+            "findomain": ["findomain", "-h"],
+            "amass": ["amass", "-version"],
+        }.get(tool_name, [tool_name, "--help"])
+
+        try:
+            subprocess.run(probe_args, capture_output=True, timeout=3)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return 0
+
+        self.notify(f"[*] Running {tool_name} (passive enumeration)...", "INFO")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.notify(f"[!] {tool_name} timeout after {timeout}s", "WARN")
+            return 0
+
+        tool_count = 0
+        for line in result.stdout.strip().split('\n'):
+            subdomain = line.strip().lower()
+            if not subdomain or subdomain in found or '.' not in subdomain:
+                continue
+            ips = self.dns.resolve(subdomain)
+            if ips:
+                found[subdomain] = SubdomainInfo(fqdn=subdomain, ips=ips)
+                tool_count += 1
+        return tool_count
 
     def _ct_lookup(self, domain: str) -> List[str]:
         """Query crt.sh for certificate transparency logs"""
@@ -2113,7 +2176,7 @@ class EventBus:
 # ─── Main Engine ────────────────────────────────────────────────────────────────
 
 class ScanEngine:
-    def __init__(self, threads: int = 25, timeout: int = 10, proxy: str = None, state_db_path: str = "autobb_state.db"):
+    def __init__(self, threads: int = 25, timeout: int = 10, proxy: str = None, state_db_path: str = "autobb_state.db", scan_mode: str = "balanced"):
         self.threads  = threads
         self.bus      = EventBus()
         self.http     = HTTPEngine(timeout=timeout, proxy=proxy)
@@ -2124,6 +2187,9 @@ class ScanEngine:
         self.targets: Dict[str, ScanTarget] = {}
         self._lock    = threading.Lock()
         self._running = False
+        self.scan_mode = (scan_mode or "balanced").lower()
+        if self.scan_mode not in {"balanced", "crazy", "profit"}:
+            self.scan_mode = "balanced"
         
         # PERSISTENT STATE - Track changes across scans
         try:
@@ -2133,6 +2199,48 @@ class ScanEngine:
             self.bus.emit("log", {"msg": f"⚠ State DB disabled: {e}", "level": "WARN"})
             self.state_db = None
             self.use_state = False
+
+    def _scan_limits(self) -> Dict[str, Any]:
+        """Execution limits tuned for scan intent."""
+        profiles = {
+            "balanced": {
+                "nuclei_severity": "critical,high,medium",
+                "nuclei_concurrency": "100",
+                "nuclei_rate": "300",
+                "nuclei_timeout": "7",
+                "nuclei_max_host_error": "5",
+                "nuclei_runtime_s": 300,
+                "nuclei_target_cap": 50,
+                "endpoint_cap": 30,
+                "live_subdomain_cap": 40,
+                "extra_nuclei_args": ["-exclude-tags", "intrusive,dos,fuzz"],
+            },
+            "crazy": {
+                "nuclei_severity": "critical,high,medium,low,info",
+                "nuclei_concurrency": "150",
+                "nuclei_rate": "600",
+                "nuclei_timeout": "12",
+                "nuclei_max_host_error": "20",
+                "nuclei_runtime_s": 900,
+                "nuclei_target_cap": None,
+                "endpoint_cap": 80,
+                "live_subdomain_cap": None,
+                "extra_nuclei_args": ["-project", "-stats"],
+            },
+            "profit": {
+                "nuclei_severity": "critical,high",
+                "nuclei_concurrency": "75",
+                "nuclei_rate": "200",
+                "nuclei_timeout": "10",
+                "nuclei_max_host_error": "10",
+                "nuclei_runtime_s": 600,
+                "nuclei_target_cap": 30,
+                "endpoint_cap": 40,
+                "live_subdomain_cap": 25,
+                "extra_nuclei_args": ["-tags", "auth,exposure,misconfig,cve"],
+            },
+        }
+        return profiles.get(self.scan_mode, profiles["balanced"])
     
     def _init_state_db(self, db_path: str):
         """Initialize persistent state database"""
@@ -2244,6 +2352,9 @@ class ScanEngine:
                 self.bus.emit("finding_critical", msg)
             elif level == "HIGH":
                 self.bus.emit("finding_high", msg)
+
+        limits = self._scan_limits()
+        notify(f"[*] Scan mode: {self.scan_mode}", "INFO")
 
         # 1. Subdomain enumeration
         self.bus.emit("phase", {"domain": domain, "phase": "Subdomain Enumeration"})
@@ -2402,11 +2513,15 @@ class ScanEngine:
                 if result_check.returncode != 0:
                     return
                 
-                notify("[*] Nuclei background scan starting (optimized for speed)", "INFO")
+                notify(f"[*] Nuclei background scan starting (mode={self.scan_mode})", "INFO")
                 
-                # Build target list - limit to 50 targets
+                # Build target list
                 targets_for_nuclei = []
-                for fqdn, info in list(subdomains.items())[:50]:
+                sub_items = list(subdomains.items())
+                target_cap = limits.get("nuclei_target_cap")
+                if target_cap:
+                    sub_items = sub_items[:target_cap]
+                for fqdn, info in sub_items:
                     if info.alive:
                         scheme = "https://" if 443 in (info.ports or []) else "http://"
                         targets_for_nuclei.append(scheme + fqdn)
@@ -2424,28 +2539,22 @@ class ScanEngine:
                 
                 notify(f"[*] Nuclei scanning {len(targets_for_nuclei)} targets (background)", "INFO")
                 
-                # OPTIMIZED FOR SPEED + POWER
                 cmd = [
                     'nuclei',
                     '-l', targets_file,
-                    '-severity', 'critical,high,medium',
+                    '-severity', limits['nuclei_severity'],
                     '-json',
                     '-silent',
-                    
-                    # SPEED SETTINGS
-                    '-c', '100',              # High concurrency
-                    '-rate-limit', '300',     # Fast
-                    '-timeout', '7',          # Quick timeout
-                    '-retries', '1',          # One retry
-                    '-max-host-error', '5',   # Skip broken hosts
-                    
-                    '-no-interactsh',         # No DNS callbacks
-                    '-exclude-tags', 'intrusive,dos,fuzz',  # Skip slow templates
-                ]
-                
-                # Run with 5 min timeout
+                    '-c', limits['nuclei_concurrency'],
+                    '-rate-limit', limits['nuclei_rate'],
+                    '-timeout', limits['nuclei_timeout'],
+                    '-retries', '1',
+                    '-max-host-error', limits['nuclei_max_host_error'],
+                    '-no-interactsh',
+                ] + limits.get('extra_nuclei_args', [])
+
                 try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=limits['nuclei_runtime_s'])
                     
                     # Parse findings
                     nuclei_count = 0
@@ -2495,7 +2604,7 @@ class ScanEngine:
                     notify(f"[+] Nuclei complete: {nuclei_count} findings", "INFO")
                 
                 except subprocess.TimeoutExpired:
-                    notify("[!] Nuclei timeout after 5min - killed", "WARN")
+                    notify(f"[!] Nuclei timeout after {limits['nuclei_runtime_s']//60}min - killed", "WARN")
                     subprocess.run(['pkill', '-9', 'nuclei'], timeout=2, stderr=subprocess.DEVNULL)
                 
                 # Cleanup
@@ -2512,9 +2621,8 @@ class ScanEngine:
             nuclei_thread = threading.Thread(target=run_nuclei_background, daemon=True)
             nuclei_thread.start()
             notify("[*] Nuclei running in background - main scan continuing", "INFO")
-        except:
-            pass
-            notify(f"[!] Nuclei error: {e}", "ERROR")
+        except Exception as e:
+            notify(f"[!] Nuclei thread error: {e}", "ERROR")
 
         def scan_sub(fqdn):
             info  = subdomains.get(fqdn)
@@ -2523,7 +2631,7 @@ class ScanEngine:
             base  = ("https://" if 443 in (info.ports or []) else "http://") + fqdn
             found = []
             # Per-endpoint checks
-            for endpoint in list(info.endpoints)[:30]:
+            for endpoint in list(info.endpoints)[:limits["endpoint_cap"]]:
                 params = info.params.get(endpoint, set()) or {"id", "q", "search", "url"}
                 for name, checker in checkers.items():
                     if name in ("headers", "cors", "ssl", "files", "csrf", "xxe"):
@@ -2549,8 +2657,11 @@ class ScanEngine:
             return found
 
         live_subs = [f for f, i in subdomains.items() if i.alive]
+        sub_cap = limits.get("live_subdomain_cap")
+        if sub_cap:
+            live_subs = live_subs[:sub_cap]
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as ex:
-            for batch in ex.map(scan_sub, live_subs[:40]):
+            for batch in ex.map(scan_sub, live_subs):
                 target.findings.extend(batch)
                 for f in batch:
                     self.bus.emit("finding", f)
