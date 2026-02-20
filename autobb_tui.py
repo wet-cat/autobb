@@ -453,7 +453,7 @@ class Renderer:
                 
                 items.append({
                     'type': 'finding',
-                    'priority': f.severity.value,
+                    'priority': f.severity.rank,
                     'label': icon,
                     'title': f.vuln_type[:50],
                     'details': f"{f.subdomain[:30]}{f.endpoint[:20]}"[:48],
@@ -463,7 +463,15 @@ class Renderer:
                 })
         
         # Sort by priority (lower = more important)
-        items.sort(key=lambda x: x['priority'])
+        def sort_priority(item):
+            p = item.get('priority', 99)
+            if isinstance(p, tuple):
+                return p[0]
+            if isinstance(p, int):
+                return p
+            return 99
+
+        items.sort(key=sort_priority)
         
         if not items:
             safe_addstr(self.scr, row + 3, (w-50)//2, 
@@ -952,9 +960,18 @@ Examples:
                         help="Optional JSON array with prior submission outcomes to tune KPI accuracy")
     parser.add_argument("--scan-mode", choices=["balanced", "crazy", "profit"], default="balanced",
                         help="Scan intensity profile: balanced (default), crazy (max coverage), profit (high-signal)")
+    parser.add_argument("--discord-webhook", metavar="URL",
+                        help="Discord webhook URL for real-time finding alerts (or set DISCORD_WEBHOOK_URL)")
     args = parser.parse_args()
 
-    engine = ScanEngine(threads=args.threads, timeout=args.timeout, proxy=args.proxy, scan_mode=args.scan_mode)
+    discord_webhook = args.discord_webhook or os.getenv("DISCORD_WEBHOOK_URL")
+    engine = ScanEngine(
+        threads=args.threads,
+        timeout=args.timeout,
+        proxy=args.proxy,
+        scan_mode=args.scan_mode,
+        discord_webhook=discord_webhook,
+    )
 
     if args.targets:
         for t in args.targets:
