@@ -40,6 +40,12 @@ python autobb_tui.py --no-tui -t example.com
 | `--niche ...` | Niche profile used for prioritization and reporting |
 | `--outcomes-file JSON` | Optional historical outcomes file to tune KPI reporting |
 | `--scan-mode {balanced,crazy,profit}` | Scan intensity profile (`balanced` default). Use `crazy` for max coverage, `profit` for high-signal triage |
+| `--health-check` | Run a dependency/environment preflight and exit |
+| `--health-check-json PATH` | Save preflight output as JSON |
+| `--summary-json PATH` | Save machine-readable run summary JSON |
+| `--fail-on-severity {critical,high,medium,low,info}` | Exit `2` if any finding at/above threshold exists |
+| `--fail-on-findings N` | Exit `2` when total findings are `>= N` |
+| `--auth-boundary-mode {block,report,allow}` | Enforce auth-boundary path handling from scope policy (`block` default) |
 
 ### Supported `--niche` values
 
@@ -119,3 +125,107 @@ Recognized KPI fields:
   - targets are alive/in-scope,
   - confidence threshold is not too high,
   - findings were produced in the JSON report.
+
+## 8) Preflight health checks
+
+Run this before long scans to validate first-class dependencies and assumptions:
+
+```bash
+python autobb_tui.py --health-check -t example.com
+```
+
+Optional JSON output:
+
+```bash
+python autobb_tui.py --health-check --health-check-json health.json
+```
+
+Checks include:
+
+- Python runtime
+- `requests` and optional `beautifulsoup4`
+- `nuclei` binary/version
+- nuclei template directory discovery
+- DNS resolution sanity check for supplied targets
+
+## 9) Headless pipeline ergonomics
+
+For CI/automation, emit a summary artifact and enforce failure gates:
+
+```bash
+python autobb_tui.py \
+  --no-tui \
+  -t target.com \
+  --summary-json run-summary.json \
+  --fail-on-severity high
+```
+
+Behavior:
+
+- exit code `0`: scan completed and thresholds not tripped
+- exit code `2`: configured quality gate tripped (`--fail-on-severity` / `--fail-on-findings`)
+
+## 10) Resume + incremental scanning
+
+```bash
+python autobb_tui.py --no-tui -t target.com --resume --incremental --checkpoint-file scan.ckpt.json
+```
+
+- `--resume`: enables checkpoint loading/saving.
+- `--incremental`: skips previously processed endpoint deltas.
+
+## 11) Scope policy guardrails
+
+Use a scope policy file to centrally enforce in-scope hosts, CIDRs, and paths before probing.
+
+Example `scope-policy.json`:
+
+```json
+{
+  "include_hosts": ["*.target.com"],
+  "exclude_hosts": ["admin.internal.target.com"],
+  "include_cidrs": [],
+  "exclude_cidrs": ["10.0.0.0/8"],
+  "allowed_paths": ["/api/*", "/graphql*", "/*"],
+  "excluded_paths": ["/logout*", "/admin/delete*"],
+  "auth_boundary_paths": ["/admin*", "/billing*"]
+}
+```
+
+Run:
+
+```bash
+python autobb_tui.py --no-tui -t target.com --scope-policy scope-policy.json --auth-boundary-mode block
+```
+
+`auth_boundary_paths` are now actively enforced before endpoint probing/checker execution.
+
+## 12) Verification workflow + reproducibility bundles
+
+```bash
+python autobb_tui.py --no-tui -t target.com --export-md --verify-before-export --generate-repro-bundles
+```
+
+- Verification performs multi-attempt baseline + variant replay checks and upgrades triage state to `ready-to-submit` only when reproducible signals are stable.
+- Repro bundles are exported under `reports/<domain>/repro_bundles/<finding_id>/`.
+
+## 13) Collaboration triage + API/webhook integrations
+
+- Findings now carry lifecycle metadata (`triage_state`, `assignee`, `comments`, `history`) in JSON exports.
+- Generic event streaming webhook:
+
+```bash
+python autobb_tui.py --no-tui -t target.com --event-webhook https://example.com/autobb-events
+```
+
+- Local API:
+
+```bash
+python autobb_tui.py --no-tui -t target.com --api-port 8787
+```
+
+Endpoints:
+- `GET /health`
+- `GET /stats`
+- `GET /findings`
+- `GET /events`

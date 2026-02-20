@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import re
 from dataclasses import dataclass
@@ -68,9 +69,10 @@ class ReportGenerator:
         "sensitive data exposure": {"sensitive data exposure", "information disclosure", "data exposure"},
     }
 
-    def __init__(self, confidence_threshold: float | None = None, niche: str = "graphql_api_auth"):
+    def __init__(self, confidence_threshold: float | None = None, niche: str = "graphql_api_auth", scope_policy: Dict | None = None):
         self.confidence_threshold = confidence_threshold or self.DEFAULT_CONFIDENCE_THRESHOLD
         self.niche = niche if niche in self.NICHE_ENDPOINT_HINTS else "graphql_api_auth"
+        self.scope_policy = scope_policy or {}
 
     def build_fingerprint(self, finding) -> str:
         endpoint = self._normalize_endpoint(finding.endpoint)
@@ -107,6 +109,8 @@ class ReportGenerator:
         findings: List,
         reports_root: str = "reports",
         outcomes_file: str | None = None,
+        require_verified: bool = False,
+        generate_repro_bundles: bool = False,
     ) -> Dict[str, int]:
         domain_dir = Path(reports_root) / self._safe_dir(domain)
         domain_dir.mkdir(parents=True, exist_ok=True)
@@ -122,7 +126,8 @@ class ReportGenerator:
 
         for item in report_items:
             in_scope = self.is_in_scope(domain, item.representative.subdomain)
-            if item.confidence >= self.confidence_threshold and in_scope:
+            verified_gate = (not require_verified) or bool(getattr(item.representative, "verified", False))
+            if item.confidence >= self.confidence_threshold and in_scope and verified_gate:
                 primary_queue.append(item)
             else:
                 manual_validation.append(item)
@@ -136,6 +141,8 @@ class ReportGenerator:
                 self.render_platform_submission(item, domain, platform="bugcrowd"),
                 encoding="utf-8",
             )
+            if generate_repro_bundles and item.representative.severity.label in {"CRITICAL", "HIGH"}:
+                self._write_repro_bundle(domain_dir, item)
 
         if chain_items:
             (domain_dir / "CHAINS.md").write_text(self.render_chain_report(chain_items), encoding="utf-8")
@@ -155,6 +162,7 @@ class ReportGenerator:
             "manual_validation": len(manual_validation),
             "chains": len(chain_items),
             "niche": self.niche,
+            "verified_required": bool(require_verified),
         }
 
     def render_finding_report(self, item: ReportItem, domain: str) -> str:
@@ -173,6 +181,9 @@ class ReportGenerator:
             f"- **CWE:** `{finding.cwe}`",
             f"- **Fingerprint:** `{item.fingerprint}`",
             f"- **Submission score:** `{self.submission_score(item, domain):.1f}`",
+            f"- **Verified reproducible:** `{'YES' if getattr(finding, 'verified', False) else 'NO'}`",
+            f"- **Triage state:** `{getattr(finding, 'triage_state', 'new')}`",
+            f"- **Assignee:** `{getattr(finding, 'assignee', '') or 'unassigned'}`",
             "",
             "## Affected asset + in-scope proof",
             f"- Root target: `{domain}`",
@@ -262,9 +273,11 @@ class ReportGenerator:
 
     def detect_exploit_chains(self, items: List[ReportItem]) -> List[Dict]:
         by_type = {}
+        by_asset = {}
         for item in items:
-            normalized = item.representative.vuln_type.lower().strip()
-            by_type[normalized] = item
+            vuln = item.representative.vuln_type.lower().strip()
+            by_type[vuln] = item
+            by_asset.setdefault(item.representative.subdomain, []).append(item)
 
         chains = []
         patterns = [
@@ -274,15 +287,27 @@ class ReportGenerator:
             ("SSRF + cloud metadata credential access", ["server-side request forgery (ssrf)", "cloud metadata exposure"], "CRITICAL", 96),
         ]
 
-        for name, needed, severity, score in patterns:
+        for name, needed, severity, base_score in patterns:
             matched = []
+            path_nodes = []
             for required in needed:
                 aliases = self.VULN_ALIASES.get(required, {required})
                 hit = next((item for vuln, item in by_type.items() if vuln in aliases or any(a in vuln for a in aliases)), None)
                 if hit:
                     matched.append(hit.finding_id)
+                    f = hit.representative
+                    path_nodes.append({"asset": f.subdomain, "weakness": f.vuln_type, "pivot": f.endpoint, "impact": self.IMPACT_BY_SEVERITY.get(f.severity.label, "impact")})
             if len(set(matched)) >= 2:
-                chains.append({"name": name, "severity": severity, "score": score, "finding_ids": sorted(set(matched))})
+                proof = sorted(set(matched))[:2]
+                score = min(100, int(base_score + (len(set(matched)) - 2) * 3))
+                chains.append({
+                    "name": name,
+                    "severity": severity,
+                    "score": score,
+                    "finding_ids": sorted(set(matched)),
+                    "attack_path": path_nodes,
+                    "minimum_proof_set": proof,
+                })
 
         return chains
 
@@ -294,8 +319,12 @@ class ReportGenerator:
                 f"- Severity: `{chain['severity']}`",
                 f"- Chain score: `{chain['score']}`",
                 f"- Linked findings: `{', '.join(chain['finding_ids'])}`",
-                "",
+                f"- Minimum proof set: `{', '.join(chain.get('minimum_proof_set', []))}`",
+                "- Attack path graph:",
             ])
+            for node in chain.get("attack_path", []):
+                lines.append(f"  - `{node.get('asset')}` → `{node.get('weakness')}` → pivot `{node.get('pivot')}` → impact `{node.get('impact')}`")
+            lines.append("")
         return "\n".join(lines)
 
     def render_platform_submission(self, item: ReportItem, domain: str, platform: str = "hackerone") -> str:
@@ -338,7 +367,15 @@ class ReportGenerator:
     def is_in_scope(self, domain: str, subdomain: str) -> bool:
         host = (subdomain or "").lower().strip()
         root = (domain or "").lower().strip()
-        return bool(host) and (host == root or host.endswith(f".{root}"))
+        if not (bool(host) and (host == root or host.endswith(f".{root}"))):
+            return False
+        include_hosts = self.scope_policy.get("include_hosts") or ["*"]
+        exclude_hosts = self.scope_policy.get("exclude_hosts") or []
+        if include_hosts and not any(fnmatch.fnmatch(host, p) for p in include_hosts):
+            return False
+        if any(fnmatch.fnmatch(host, p) for p in exclude_hosts):
+            return False
+        return True
 
     def matches_niche(self, endpoint: str) -> bool:
         endpoint = (endpoint or "").lower()
@@ -376,6 +413,21 @@ class ReportGenerator:
 
     def _safe_dir(self, value: str) -> str:
         return re.sub(r"[^a-zA-Z0-9._-]", "_", value)
+
+    def _write_repro_bundle(self, domain_dir: Path, item: ReportItem):
+        finding = item.representative
+        bundle_dir = domain_dir / "repro_bundles" / item.finding_id
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        (bundle_dir / "request_template.http").write_text(finding.request or "N/A", encoding="utf-8")
+        curl_cmd = f"curl -i '{finding.subdomain}{finding.endpoint}'"
+        (bundle_dir / "repro.sh").write_text(curl_cmd + "\n", encoding="utf-8")
+        (bundle_dir / "evidence.json").write_text(json.dumps({
+            "finding_id": item.finding_id,
+            "expected": "secure handling / sanitized output / denied unauthorized action",
+            "observed": finding.evidence or finding.response,
+            "confidence": item.confidence,
+        }, indent=2), encoding="utf-8")
+
 
 
 class ProgramProfileStore:
@@ -461,5 +513,12 @@ class ProgramProfileStore:
             "js_heavy_spa": (["xss", "api-discovery", "cors", "token-storage"], ["ssl-cipher-only"]),
         }
         priority, deprioritized = hints.get(niche, ([], []))
-        _ = self.data.setdefault(domain, {"history": [], "signals": {}, "outcomes": []})
+        profile = self.data.setdefault(domain, {"history": [], "signals": {}, "outcomes": []})
+        outcomes = profile.get("outcomes", [])[-50:]
+        dup = sum(1 for o in outcomes if o.get("disposition") in {"duplicate", "informative"})
+        acc = sum(1 for o in outcomes if o.get("disposition") == "accepted")
+        if outcomes and dup > acc:
+            deprioritized = list(set(deprioritized + ["broad-low-signal-payloads"]))
+        if outcomes and acc >= dup:
+            priority = list(set(priority + ["high-confidence-chain-variants"]))
         return {"priority_checks": priority, "deprioritized_checks": deprioritized}

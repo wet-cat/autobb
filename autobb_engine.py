@@ -30,6 +30,7 @@ import sys
 import subprocess
 
 from reporting import ReportGenerator
+from autobb_ops import ScopePolicy, CheckpointStore, VerificationWorkflow, EventStreamer
 
 try:
     import requests
@@ -89,6 +90,10 @@ class Finding:
     timestamp:    str = field(default_factory=lambda: datetime.now().isoformat())
     verified:     bool = False
     false_positive: bool = False
+    triage_state: str = "new"
+    assignee: str = ""
+    comments: List[str] = field(default_factory=list)
+    history: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self):
         d = asdict(self)
@@ -2352,7 +2357,7 @@ class EventBus:
 # ─── Main Engine ────────────────────────────────────────────────────────────────
 
 class ScanEngine:
-    def __init__(self, threads: int = 25, timeout: int = 10, proxy: str = None, state_db_path: str = "autobb_state.db", scan_mode: str = "balanced", discord_webhook: str = None):
+    def __init__(self, threads: int = 25, timeout: int = 10, proxy: str = None, state_db_path: str = "autobb_state.db", scan_mode: str = "balanced", discord_webhook: str = None, resume_mode: bool = False, incremental_mode: bool = False, checkpoint_file: str = "autobb_checkpoint.json", scope_policy_file: str | None = None, event_webhook: str | None = None, auth_boundary_mode: str = "block"):
         self.threads  = threads
         self.bus      = EventBus()
         self.http     = HTTPEngine(timeout=timeout, proxy=proxy)
@@ -2369,6 +2374,14 @@ class ScanEngine:
         self.discord_webhook = (discord_webhook or "").strip() or None
         self._discord_sent: Set[str] = set()
         self._discord_lock = threading.Lock()
+        self.resume_mode = bool(resume_mode)
+        self.incremental_mode = bool(incremental_mode)
+        self.checkpoints = CheckpointStore(checkpoint_file)
+        self.scope_policy = ScopePolicy(scope_policy_file)
+        self.verifier = VerificationWorkflow(self.http)
+        self.event_stream = EventStreamer(event_webhook, requests if HAS_REQUESTS else None)
+        self.tuning = {"confidence_shift": 0.0, "nuclei_rate_multiplier": 1.0, "severity_bias": "balanced"}
+        self.auth_boundary_mode = auth_boundary_mode if auth_boundary_mode in {"block", "report", "allow"} else "block"
         
         # PERSISTENT STATE - Track changes across scans
         try:
@@ -2378,6 +2391,28 @@ class ScanEngine:
             self.bus.emit("log", {"msg": f"⚠ State DB disabled: {e}", "level": "WARN"})
             self.state_db = None
             self.use_state = False
+
+    def apply_outcomes_tuning(self, outcomes_file: str | None):
+        if not outcomes_file or not Path(outcomes_file).exists():
+            return
+        try:
+            payload = json.loads(Path(outcomes_file).read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(payload, list) or not payload:
+            return
+        accepted = sum(1 for o in payload if isinstance(o, dict) and o.get("disposition") == "accepted")
+        duplicates = sum(1 for o in payload if isinstance(o, dict) and o.get("disposition") in {"duplicate", "informative"})
+        total = max(1, accepted + duplicates)
+        dup_rate = duplicates / total
+        if dup_rate > 0.5:
+            self.tuning["confidence_shift"] = 0.08
+            self.tuning["nuclei_rate_multiplier"] = 0.8
+            self.tuning["severity_bias"] = "precision"
+        elif accepted / total > 0.5:
+            self.tuning["confidence_shift"] = -0.03
+            self.tuning["nuclei_rate_multiplier"] = 1.2
+            self.tuning["severity_bias"] = "coverage"
 
     def _scan_limits(self) -> Dict[str, Any]:
         """Execution limits tuned for scan intent."""
@@ -2419,7 +2454,14 @@ class ScanEngine:
                 "extra_nuclei_args": ["-tags", "auth,exposure,misconfig,cve"],
             },
         }
-        return profiles.get(self.scan_mode, profiles["balanced"])
+        limits = profiles.get(self.scan_mode, profiles["balanced"]).copy()
+        limits["nuclei_rate"] = str(max(50, int(int(limits["nuclei_rate"]) * float(self.tuning.get("nuclei_rate_multiplier", 1.0)))))
+        bias = self.tuning.get("severity_bias", "balanced")
+        if bias == "precision":
+            limits["nuclei_severity"] = "critical,high"
+        elif bias == "coverage":
+            limits["nuclei_severity"] = "critical,high,medium,low"
+        return limits
     
     def _init_state_db(self, db_path: str):
         """Initialize persistent state database"""
@@ -2453,8 +2495,24 @@ class ScanEngine:
         conn.commit()
         return conn
 
+    def _emit_event(self, event_type: str, data: Dict[str, Any]):
+        event = {"type": event_type, "ts": time.time(), "data": data}
+        self.event_stream.emit(event)
+
+    def _transition_finding(self, finding: Finding, state: str, note: str = ""):
+        finding.triage_state = state
+        finding.history.append({"ts": datetime.now().isoformat(), "state": state, "note": note})
+
     def _emit_finding(self, finding: Finding):
+        shift = float(self.tuning.get("confidence_shift", 0.0))
+        finding.confidence = max(0.0, min(1.0, float(getattr(finding, "confidence", 0.0)) + shift))
+        if not getattr(finding, "history", None):
+            finding.history = []
+        if not finding.triage_state:
+            finding.triage_state = "new"
+        finding.history.append({"ts": datetime.now().isoformat(), "state": finding.triage_state, "note": "discovered"})
         self.bus.emit("finding", finding)
+        self._emit_event("finding", {"id": finding.id, "severity": finding.severity.label, "target": finding.target, "state": finding.triage_state})
         self._notify_discord_finding(finding)
 
     def _notify_discord_finding(self, finding: Finding):
@@ -2507,9 +2565,13 @@ class ScanEngine:
         domain = domain.lower().strip()
         domain = domain.removeprefix("https://").removeprefix("http://")
         domain = domain.split("/")[0]
+        if not self.scope_policy.host_allowed(domain):
+            self.bus.emit("log", {"msg": f"⛔ target blocked by scope policy: {domain}", "level": "WARN"})
+            return
         with self._lock:
             self.targets[domain] = ScanTarget(domain=domain)
         self.bus.emit("target_added", domain)
+        self._emit_event("target_added", {"domain": domain})
 
     def run_all(self):
         """Process all queued targets sequentially"""
@@ -2525,6 +2587,7 @@ class ScanEngine:
             return
         
         self.bus.emit("log", {"msg": f"📋 Queue: {len(queued)} targets", "level": "INFO"})
+        self._emit_event("scan_queue", {"targets": queued})
         
         # Process each target
         for i, domain in enumerate(queued, 1):
@@ -2550,6 +2613,7 @@ class ScanEngine:
                     "msg": f"✓ [{i}/{len(queued)}] {domain} complete: {stats['findings']} findings ({stats['critical']} critical, {stats['high']} high)",
                     "level": "INFO"
                 })
+                self._emit_event("scan_done", {"domain": domain, **stats})
                 self.bus.emit("scan_done", {"domain": domain, "findings": stats['findings']})
             
             except KeyboardInterrupt:
@@ -2594,6 +2658,17 @@ class ScanEngine:
         apex_ips = self.dns.resolve(domain)
         if apex_ips:
             subdomains[domain] = SubdomainInfo(fqdn=domain, ips=apex_ips)
+
+        scoped_subdomains = {}
+        for fqdn, info in subdomains.items():
+            if not self.scope_policy.host_allowed(fqdn):
+                notify(f"⛔ scope policy blocked host: {fqdn}", "WARN")
+                continue
+            if info.ips and not any(self.scope_policy.ip_allowed(ip) for ip in info.ips):
+                notify(f"⛔ scope policy blocked IP range host: {fqdn}", "WARN")
+                continue
+            scoped_subdomains[fqdn] = info
+        subdomains = scoped_subdomains
 
         target.subdomains = subdomains
         self.bus.emit("subdomain_count", {"domain": domain, "count": len(subdomains)})
@@ -2864,6 +2939,17 @@ class ScanEngine:
             found = []
             # Per-endpoint checks
             for endpoint in list(info.endpoints)[:limits["endpoint_cap"]]:
+                if self.scope_policy.auth_boundary(endpoint):
+                    if self.auth_boundary_mode == "block":
+                        notify(f"⛔ auth-boundary blocked endpoint: {fqdn}{endpoint}", "WARN")
+                        continue
+                    if self.auth_boundary_mode == "report":
+                        notify(f"⚠ auth-boundary endpoint requires explicit approval: {fqdn}{endpoint}", "WARN")
+                if not self.scope_policy.path_allowed(endpoint):
+                    notify(f"⛔ scope policy blocked path: {fqdn}{endpoint}", "WARN")
+                    continue
+                if self.resume_mode and self.incremental_mode and self.checkpoints.seen_endpoint(domain, fqdn, endpoint):
+                    continue
                 params = info.params.get(endpoint, set()) or {"id", "q", "search", "url"}
                 for name, checker in checkers.items():
                     if name in ("headers", "cors", "ssl", "files", "csrf", "xxe", "jssecrets"):
@@ -2872,6 +2958,8 @@ class ScanEngine:
                         found += checker.check(base, endpoint, params)
                     except Exception as exc:
                         notify(f"[!] {name} checker failed on {fqdn}{endpoint}: {exc}", "WARN")
+                if self.resume_mode:
+                    self.checkpoints.mark_endpoint(domain, fqdn, endpoint)
             # Per-host checks
             try:
                 found += checkers["headers"].check(base, info)
@@ -2905,6 +2993,8 @@ class ScanEngine:
             return found
 
         live_subs = [f for f, i in subdomains.items() if i.alive]
+        if self.resume_mode and self.incremental_mode:
+            live_subs = [f for f in live_subs if (not self.checkpoints.seen_host(domain, f)) or any(not self.checkpoints.seen_endpoint(domain, f, ep) for ep in list(subdomains.get(f).endpoints)[:limits["endpoint_cap"]])]
         if not live_subs:
             # Fallback mode: still attempt scans on a bounded set of discovered
             # subdomains that have seeded/discovered endpoints.
@@ -3013,12 +3103,20 @@ class ScanEngine:
                 out[f.severity.label.lower()] += 1
         return out
 
-    def export_json(self, path: str, export_md: bool = False, reports_root: str = "reports", confidence_threshold: float = 0.70, niche: str = "graphql_api_auth", outcomes_file: str | None = None):
+    def export_json(self, path: str, export_md: bool = False, reports_root: str = "reports", confidence_threshold: float = 0.70, niche: str = "graphql_api_auth", outcomes_file: str | None = None, verify_before_export: bool = False, generate_repro_bundles: bool = False):
         data = {}
         markdown_exports = {}
-        reporter = ReportGenerator(confidence_threshold=confidence_threshold, niche=niche) if export_md else None
+        reporter = ReportGenerator(confidence_threshold=confidence_threshold, niche=niche, scope_policy=self.scope_policy.to_dict()) if export_md else None
 
         for domain, t in self.targets.items():
+            if verify_before_export:
+                for f in t.findings:
+                    vr = self.verifier.verify_finding(f)
+                    f.verified = bool(vr.get("verified"))
+                    if f.verified:
+                        self._transition_finding(f, "ready-to-submit", "verification passed")
+                    else:
+                        self._transition_finding(f, "needs-repro", str(vr.get("reason", "unverified")))
             findings = [f.to_dict() for f in t.findings]
             data[domain] = {
                 "status":     t.status,
@@ -3027,7 +3125,7 @@ class ScanEngine:
                 "findings":   findings,
             }
             if reporter:
-                markdown_exports[domain] = reporter.export_domain_reports(domain, t.findings, reports_root=reports_root, outcomes_file=outcomes_file)
+                markdown_exports[domain] = reporter.export_domain_reports(domain, t.findings, reports_root=reports_root, outcomes_file=outcomes_file, require_verified=verify_before_export, generate_repro_bundles=generate_repro_bundles)
 
         payload = {"scan_date": datetime.now().isoformat(), "results": data}
         if export_md:
