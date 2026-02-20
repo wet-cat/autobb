@@ -13,6 +13,8 @@ import os
 import sys
 import json
 import signal
+import shutil
+import socket
 from datetime import datetime
 from typing import List, Dict, Optional, Deque
 from collections import deque
@@ -20,6 +22,7 @@ from collections import deque
 # Must be importable from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from autobb_engine import ScanEngine, Severity, Finding, ScanTarget
+from autobb_ops import LocalAPIServer
 
 # Default attribute fallbacks for non-curses contexts/tests
 C_DEFAULT = C_CRIT = C_HIGH = C_MED = C_LOW = 0
@@ -948,7 +951,114 @@ Examples:
                         help="Scan intensity profile: balanced (default), crazy (max coverage), profit (high-signal)")
     parser.add_argument("--discord-webhook", metavar="URL",
                         help="Discord webhook URL for real-time finding alerts (or set DISCORD_WEBHOOK_URL)")
+    parser.add_argument("--health-check", action="store_true",
+                        help="Run dependency/environment preflight checks and exit")
+    parser.add_argument("--health-check-json", metavar="PATH",
+                        help="Write health-check results as JSON")
+    parser.add_argument("--summary-json", metavar="PATH",
+                        help="Write machine-readable run summary JSON")
+    parser.add_argument("--fail-on-severity", choices=["critical", "high", "medium", "low", "info"],
+                        help="Return exit code 2 if findings at/above severity exist")
+    parser.add_argument("--fail-on-findings", type=int,
+                        help="Return exit code 2 when total findings >= this value")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from checkpoint and skip already processed endpoints")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Only process deltas discovered since prior checkpoint")
+    parser.add_argument("--checkpoint-file", default="autobb_checkpoint.json", metavar="PATH",
+                        help="Checkpoint file path for resume/incremental mode")
+    parser.add_argument("--scope-policy", metavar="JSON",
+                        help="Scope policy JSON with include/exclude host/path/CIDR guardrails")
+    parser.add_argument("--verify-before-export", action="store_true",
+                        help="Run verification workflow and require reproducibility before primary submission export")
+    parser.add_argument("--generate-repro-bundles", action="store_true",
+                        help="Generate repro bundles for high-value findings in reports/<domain>/repro_bundles")
+    parser.add_argument("--event-webhook", metavar="URL",
+                        help="Generic webhook URL for AutoBB event stream payloads")
+    parser.add_argument("--api-port", type=int,
+                        help="Expose local API on 127.0.0.1:<port> with /health /stats /findings /events")
+    parser.add_argument("--auth-boundary-mode", choices=["block", "report", "allow"], default="block",
+                        help="How to handle auth boundary paths from scope policy: block (default), report, allow")
     args = parser.parse_args()
+
+    severity_order = ["critical", "high", "medium", "low", "info"]
+
+    def _write_json(path: str, payload: Dict):
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+
+    def run_health_check() -> int:
+        checks = []
+
+        def add_check(name: str, ok: bool, details: str):
+            checks.append({"name": name, "ok": ok, "details": details})
+
+        add_check("python", True, f"{sys.version.split()[0]}")
+        add_check("requests", bool(getattr(sys.modules.get("autobb_engine"), "HAS_REQUESTS", False)),
+                  "installed" if getattr(sys.modules.get("autobb_engine"), "HAS_REQUESTS", False) else "missing")
+        add_check("beautifulsoup4", bool(getattr(sys.modules.get("autobb_engine"), "HAS_BS4", False)),
+                  "installed" if getattr(sys.modules.get("autobb_engine"), "HAS_BS4", False) else "missing (optional)")
+
+        nuclei_path = shutil.which("nuclei")
+        if nuclei_path:
+            try:
+                import subprocess
+                ver = subprocess.run(["nuclei", "-version"], capture_output=True, text=True, timeout=3)
+                ver_txt = (ver.stdout or ver.stderr or "").strip().splitlines()[0] if (ver.stdout or ver.stderr) else "unknown"
+                add_check("nuclei_binary", ver.returncode == 0, f"{nuclei_path} ({ver_txt})")
+            except Exception as exc:
+                add_check("nuclei_binary", False, f"{nuclei_path} (version check failed: {exc})")
+        else:
+            add_check("nuclei_binary", False, "not found in PATH")
+
+        template_dirs = [
+            os.getenv("NUCLEI_TEMPLATES"),
+            os.path.expanduser("~/.local/nuclei-templates"),
+            os.path.expanduser("~/nuclei-templates"),
+        ]
+        template_dirs = [d for d in template_dirs if d]
+        tpl_found = None
+        tpl_count = 0
+        for d in template_dirs:
+            if os.path.isdir(d):
+                tpl_found = d
+                try:
+                    tpl_count = sum(1 for _ in os.scandir(d))
+                except OSError:
+                    tpl_count = 0
+                break
+        add_check("nuclei_templates", bool(tpl_found), f"{tpl_found} ({tpl_count} top-level entries)" if tpl_found else "not found")
+
+        dns_ok = True
+        dns_detail = "skipped (no targets provided)"
+        if args.targets:
+            test_target = args.targets[0]
+            try:
+                socket.gethostbyname(test_target)
+                dns_detail = f"resolved {test_target}"
+            except Exception as exc:
+                dns_ok = False
+                dns_detail = f"failed to resolve {test_target}: {exc}"
+        add_check("dns_resolution", dns_ok, dns_detail)
+
+        ok_count = sum(1 for c in checks if c["ok"])
+        payload = {
+            "timestamp": datetime.now().isoformat(),
+            "ok": all(c["ok"] for c in checks if c["name"] in {"python", "requests", "nuclei_binary"}),
+            "checks": checks,
+            "summary": {"passed": ok_count, "total": len(checks)},
+        }
+        for c in checks:
+            prefix = "[OK]" if c["ok"] else "[WARN]"
+            print(f"{prefix} {c['name']}: {c['details']}")
+        print(f"[*] Health check: {payload['summary']['passed']}/{payload['summary']['total']} checks passed")
+        _write_json(args.health_check_json, payload)
+        return 0 if payload["ok"] else 1
+
+    if args.health_check:
+        raise SystemExit(run_health_check())
 
     discord_webhook = args.discord_webhook or os.getenv("DISCORD_WEBHOOK_URL")
     engine = ScanEngine(
@@ -957,11 +1067,24 @@ Examples:
         proxy=args.proxy,
         scan_mode=args.scan_mode,
         discord_webhook=discord_webhook,
+        resume_mode=args.resume,
+        incremental_mode=args.incremental,
+        checkpoint_file=args.checkpoint_file,
+        scope_policy_file=args.scope_policy,
+        event_webhook=args.event_webhook,
+        auth_boundary_mode=args.auth_boundary_mode,
     )
+    if args.outcomes_file:
+        engine.apply_outcomes_tuning(args.outcomes_file)
 
     if args.targets:
         for t in args.targets:
             engine.add_target(t)
+
+    api_server = None
+    if args.api_port:
+        api_server = LocalAPIServer(engine, port=args.api_port)
+        api_server.start()
 
     def run_headless():
         print(f"[*] AutoBB v5 — headless mode")
@@ -985,18 +1108,43 @@ Examples:
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = f"autobb_report_{ts}.json"
-        engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold, niche=args.niche, outcomes_file=args.outcomes_file)
+        engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold, niche=args.niche, outcomes_file=args.outcomes_file, verify_before_export=args.verify_before_export, generate_repro_bundles=args.generate_repro_bundles)
         print(f"\n[+] Report saved: {path}")
         if args.export_md:
             print(f"[+] Markdown reports: reports/<domain>/SUMMARY.md")
         stats = engine.stats()
         print(f"[+] Findings: {stats['findings']}  Critical: {stats['critical']}  High: {stats['high']}")
+        return path, stats
+
+    def build_run_summary(report_path: Optional[str], stats: Dict, mode: str) -> Dict:
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "mode": mode,
+            "targets": args.targets or [],
+            "scan_mode": args.scan_mode,
+            "report_path": report_path,
+            "stats": stats,
+        }
+
+    def compute_exit_code(stats: Dict) -> int:
+        if args.fail_on_findings is not None and stats.get("findings", 0) >= args.fail_on_findings:
+            return 2
+        if args.fail_on_severity:
+            trigger_idx = severity_order.index(args.fail_on_severity)
+            for sev in severity_order[:trigger_idx + 1]:
+                if stats.get(sev, 0) > 0:
+                    return 2
+        return 0
 
     wants_tui = not args.no_tui
     has_tty = sys.stdin.isatty() and sys.stdout.isatty()
 
     if not wants_tui:
-        run_headless()
+        report_path, stats = run_headless()
+        _write_json(args.summary_json, build_run_summary(report_path, stats, mode="headless"))
+        if api_server:
+            api_server.stop()
+        raise SystemExit(compute_exit_code(stats))
     else:
         # TUI mode
         if not has_tty:
@@ -1025,11 +1173,17 @@ Examples:
         if stats["findings"] > 0:
             ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = f"autobb_report_{ts}.json"
-            engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold, niche=args.niche, outcomes_file=args.outcomes_file)
+            engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold, niche=args.niche, outcomes_file=args.outcomes_file, verify_before_export=args.verify_before_export, generate_repro_bundles=args.generate_repro_bundles)
             print(f"\n  Report:     {path}")
             if args.export_md:
                 print("  Markdown:   reports/<domain>/SUMMARY.md")
+        else:
+            path = None
+        _write_json(args.summary_json, build_run_summary(path, stats, mode="tui"))
         print()
+        if api_server:
+            api_server.stop()
+        raise SystemExit(compute_exit_code(stats))
 
 if __name__ == "__main__":
     main()
