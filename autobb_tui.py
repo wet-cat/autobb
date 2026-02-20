@@ -950,9 +950,11 @@ Examples:
                         help="Scanner/report niche profile to optimize high-value workflow (default: graphql_api_auth)")
     parser.add_argument("--outcomes-file", metavar="JSON",
                         help="Optional JSON array with prior submission outcomes to tune KPI accuracy")
+    parser.add_argument("--scan-mode", choices=["balanced", "crazy", "profit"], default="balanced",
+                        help="Scan intensity profile: balanced (default), crazy (max coverage), profit (high-signal)")
     args = parser.parse_args()
 
-    engine = ScanEngine(threads=args.threads, timeout=args.timeout, proxy=args.proxy)
+    engine = ScanEngine(threads=args.threads, timeout=args.timeout, proxy=args.proxy, scan_mode=args.scan_mode)
 
     if args.targets:
         for t in args.targets:
