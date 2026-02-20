@@ -21,27 +21,13 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from autobb_engine import ScanEngine, Severity, Finding, ScanTarget
 
-# ─── Colour Palette ─────────────────────────────────────────────────────────────
+# Default attribute fallbacks for non-curses contexts/tests
+C_DEFAULT = C_CRIT = C_HIGH = C_MED = C_LOW = 0
+C_ACCENT = C_SUB = 0
+C_BADGE_CRIT = C_BADGE_HIGH = C_BADGE_MED = C_BADGE_LOW = 0
+C_SEL = C_HEADER = C_DIM = C_BADGE_INFO = 0
 
-def init_colors():
-    curses.start_color()
-    curses.use_default_colors()
-    # pair_number, fg, bg
-    curses.init_pair(1,  curses.COLOR_WHITE,   -1)          # default
-    curses.init_pair(2,  curses.COLOR_RED,     -1)          # critical
-    curses.init_pair(3,  curses.COLOR_YELLOW,  -1)          # high
-    curses.init_pair(4,  curses.COLOR_CYAN,    -1)          # medium
-    curses.init_pair(5,  curses.COLOR_GREEN,   -1)          # low / ok
-    curses.init_pair(6,  curses.COLOR_MAGENTA, -1)          # info / accent
-    curses.init_pair(7,  curses.COLOR_BLUE,    -1)          # subdomain
-    curses.init_pair(8,  curses.COLOR_WHITE,   curses.COLOR_RED)    # critical badge
-    curses.init_pair(9,  curses.COLOR_BLACK,   curses.COLOR_YELLOW) # high badge
-    curses.init_pair(10, curses.COLOR_BLACK,   curses.COLOR_CYAN)   # medium badge
-    curses.init_pair(11, curses.COLOR_BLACK,   curses.COLOR_GREEN)  # low badge
-    curses.init_pair(12, curses.COLOR_BLACK,   curses.COLOR_WHITE)  # selected row
-    curses.init_pair(13, curses.COLOR_WHITE,   curses.COLOR_BLUE)   # header bar
-    curses.init_pair(14, curses.COLOR_CYAN,    -1)          # dim accent
-    curses.init_pair(15, curses.COLOR_BLACK,   curses.COLOR_MAGENTA) # info badge
+# ─── Colour Palette ─────────────────────────────────────────────────────────────
 
 def init_colors():
     global C_DEFAULT, C_CRIT, C_HIGH, C_MED, C_LOW
@@ -977,8 +963,7 @@ Examples:
         for t in args.targets:
             engine.add_target(t)
 
-    if args.no_tui:
-        # Headless mode
+    def run_headless():
         print(f"[*] AutoBB v5 — headless mode")
         print(f"[*] Targets: {args.targets}")
         print(f"[*] Scanning...")
@@ -988,8 +973,8 @@ Examples:
                 for evt in engine.bus.drain():
                     if evt["type"] == "log":
                         d = evt["data"]
-                        lvl = d.get("level","INFO")
-                        col = {"CRITICAL":"\033[91m","HIGH":"\033[93m","FOUND":"\033[96m"}.get(lvl,"")
+                        lvl = d.get("level", "INFO")
+                        col = {"CRITICAL": "\033[91m", "HIGH": "\033[93m", "FOUND": "\033[96m"}.get(lvl, "")
                         print(f"{col}[{lvl}] {d['msg']}\033[0m")
                 time.sleep(0.05)
 
@@ -998,7 +983,7 @@ Examples:
         engine.run_all()
         t.join(timeout=1)
 
-        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = f"autobb_report_{ts}.json"
         engine.export_json(path, export_md=args.export_md, confidence_threshold=args.confidence_threshold, niche=args.niche, outcomes_file=args.outcomes_file)
         print(f"\n[+] Report saved: {path}")
@@ -1006,10 +991,25 @@ Examples:
             print(f"[+] Markdown reports: reports/<domain>/SUMMARY.md")
         stats = engine.stats()
         print(f"[+] Findings: {stats['findings']}  Critical: {stats['critical']}  High: {stats['high']}")
+
+    wants_tui = not args.no_tui
+    has_tty = sys.stdin.isatty() and sys.stdout.isatty()
+
+    if not wants_tui:
+        run_headless()
     else:
         # TUI mode
+        if not has_tty:
+            print("[!] No interactive TTY detected; falling back to --no-tui mode.")
+            run_headless()
+            return
         os.environ.setdefault("TERM", "xterm-256color")
-        curses.wrapper(tui_main, engine)
+        try:
+            curses.wrapper(tui_main, engine)
+        except curses.error:
+            print("[!] Failed to initialize curses TUI; falling back to --no-tui mode.")
+            run_headless()
+            return
         # After exit, print summary
         stats = engine.stats()
         print(f"\n\033[1m AutoBB v5 — Session Summary\033[0m")
